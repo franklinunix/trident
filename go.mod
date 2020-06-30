@@ -33,6 +33,7 @@ require (
 	github.com/spf13/cobra v1.0.0
 	github.com/stretchr/testify v1.5.1
 	golang.org/x/crypto v0.0.0-20200406173513-056763e48d71 // github.com/golang/crypto
+	golang.org/x/net v0.0.0-20191112182307-2180aed22343 // indirect
 	golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d // github.com/golang/oauth2
 	golang.org/x/sys v0.0.0-20200413165638-669c56c373c4 // github.com/golang/sys
 	google.golang.org/grpc v1.26.0 // github.com/grpc/grpc-go

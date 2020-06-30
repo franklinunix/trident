@@ -31,16 +31,20 @@ import (
 // recordTiming is used to record in Prometheus the total time taken for an operation as follows:
 //   defer recordTiming("backend_add")()
 // see also: https://play.golang.org/p/6xRXlhFdqBd
-func recordTiming(operation string) func() {
+func recordTiming(operation string, err *error) func() {
 	startTime := time.Now()
 	return func() {
 		endTime := time.Since(startTime)
 		endTimeMS := float64(endTime.Milliseconds())
-		operationDurationInMsSummary.WithLabelValues(operation).Observe(endTimeMS)
+		success := "true"
+		if *err != nil {
+			success = "false"
+		}
+		operationDurationInMsSummary.WithLabelValues(operation, success).Observe(endTimeMS)
 	}
 }
 
-func recordTransactionTiming(txn *storage.VolumeTransaction) {
+func recordTransactionTiming(txn *storage.VolumeTransaction, err *error) {
 	if txn == nil || txn.VolumeCreatingConfig == nil {
 		// for unit tests, there will be no txn to record
 		return
@@ -51,7 +55,11 @@ func recordTransactionTiming(txn *storage.VolumeTransaction) {
 	startTime := txn.VolumeCreatingConfig.StartTime
 	endTime := time.Since(startTime)
 	endTimeMS := float64(endTime.Milliseconds())
-	operationDurationInMsSummary.WithLabelValues(operation).Observe(endTimeMS)
+	success := "true"
+	if *err != nil {
+		success = "false"
+	}
+	operationDurationInMsSummary.WithLabelValues(operation, success).Observe(endTimeMS)
 }
 
 type TridentOrchestrator struct {
@@ -447,26 +455,40 @@ func (o *TridentOrchestrator) Stop() {
 // The caller should hold the orchestrator lock.
 func (o *TridentOrchestrator) updateMetrics() {
 
-	backendsGauge.Set(float64(len(o.backends)))
+	tridentBuildInfo.WithLabelValues(config.BuildHash,
+		config.OrchestratorVersion.ShortString(),
+		config.BuildType).Set(float64(1))
+
+	backendsGauge.Reset()
 	backendsByTypeGauge.Reset()
 	backendsByStateGauge.Reset()
 	for _, backend := range o.backends {
+		backendsGauge.WithLabelValues(backend.GetDriverName(), backend.State.String()).Inc()
 		backendsByTypeGauge.WithLabelValues(backend.GetDriverName()).Inc()
 		backendsByStateGauge.WithLabelValues(string(backend.State)).Inc()
+		tridentBackendInfo.WithLabelValues(backend.GetDriverName(), backend.Name, backend.BackendUUID).Set(float64(1))
 	}
 
-	volumesGauge.Set(float64(len(o.volumes)))
+	volumesGauge.Reset()
 	volumesByBackendGauge.Reset()
 	volumesByStateGauge.Reset()
 	volumesTotalBytesByBackendGauge.Reset()
 	volumesTotalBytes := float64(0)
+	backendAllocatedBytesGauge.Reset()
 	for _, volume := range o.volumes {
 		bytes, _ := strconv.ParseFloat(volume.Config.Size, 64)
 		volumesTotalBytes += bytes
 		if backend, err := o.getBackendByBackendUUID(volume.BackendUUID); err == nil {
 			driverName := backend.GetDriverName()
+			volumesGauge.WithLabelValues(driverName,
+				volume.BackendUUID,
+				string(volume.State),
+				string(volume.Config.VolumeMode)).Inc()
 			volumesByBackendGauge.WithLabelValues(driverName).Inc()
 			volumesTotalBytesByBackendGauge.WithLabelValues(driverName).Add(bytes)
+
+			backendAllocatedBytesGauge.WithLabelValues(driverName, backend.BackendUUID, string(volume.State),
+				string(volume.Config.VolumeMode)).Add(bytes)
 		}
 		volumesByStateGauge.WithLabelValues(string(volume.State)).Inc()
 	}
@@ -474,7 +496,21 @@ func (o *TridentOrchestrator) updateMetrics() {
 
 	scGauge.Set(float64(len(o.storageClasses)))
 	nodeGauge.Set(float64(len(o.nodes)))
-	snapshotGauge.Set(float64(len(o.snapshots)))
+	snapshotGauge.Reset()
+	snapshotAllocatedBytesGauge.Reset()
+	for _, snapshot := range o.snapshots {
+		vol := o.volumes[snapshot.Config.VolumeName]
+		if vol != nil {
+			if backend, err := o.getBackendByBackendUUID(vol.BackendUUID); err == nil {
+				driverName := backend.GetDriverName()
+				snapshotGauge.WithLabelValues(
+					driverName,
+					vol.BackendUUID).Inc()
+				snapshotAllocatedBytesGauge.WithLabelValues(driverName, backend.BackendUUID).
+					Add(float64(snapshot.SizeBytes))
+			}
+		}
+	}
 }
 
 func (o *TridentOrchestrator) handleFailedTransaction(v *storage.VolumeTransaction) error {
@@ -767,12 +803,13 @@ func (o *TridentOrchestrator) GetVersion() (string, error) {
 }
 
 // AddBackend handles creation of a new storage backend
-func (o *TridentOrchestrator) AddBackend(configJSON string) (*storage.BackendExternal, error) {
+func (o *TridentOrchestrator) AddBackend(configJSON string) (
+	backendExternal *storage.BackendExternal, err error) {
 	if o.bootstrapError != nil {
 		return nil, o.bootstrapError
 	}
 
-	defer recordTiming("backend_add")()
+	defer recordTiming("backend_add", &err)()
 
 	o.mutex.Lock()
 	defer o.mutex.Unlock()
@@ -882,7 +919,7 @@ func (o *TridentOrchestrator) UpdateBackend(backendName, configJSON string) (
 		return nil, o.bootstrapError
 	}
 
-	defer recordTiming("backend_update")()
+	defer recordTiming("backend_update", &err)()
 
 	o.mutex.Lock()
 	defer o.mutex.Unlock()
@@ -918,18 +955,18 @@ func (o *TridentOrchestrator) updateBackend(backendName, configJSON string) (
 
 // UpdateBackendByBackendUUID updates an existing backend.
 func (o *TridentOrchestrator) UpdateBackendByBackendUUID(backendName, configJSON, backendUUID string) (
-	backendExternal *storage.BackendExternal, err error) {
+	backend *storage.BackendExternal, err error) {
 	if o.bootstrapError != nil {
 		return nil, o.bootstrapError
 	}
 
-	defer recordTiming("backend_update")()
+	defer recordTiming("backend_update", &err)()
 
 	o.mutex.Lock()
 	defer o.mutex.Unlock()
 	defer o.updateMetrics()
 
-	backend, err := o.updateBackendByBackendUUID(backendName, configJSON, backendUUID)
+	backend, err = o.updateBackendByBackendUUID(backendName, configJSON, backendUUID)
 	if err != nil {
 		return backend, err
 	}
@@ -1130,7 +1167,7 @@ func (o *TridentOrchestrator) UpdateBackendState(backendName, backendState strin
 		return nil, o.bootstrapError
 	}
 
-	defer recordTiming("backend_update_state")()
+	defer recordTiming("backend_update_state", &err)()
 
 	o.mutex.Lock()
 	defer o.mutex.Unlock()
@@ -1204,12 +1241,13 @@ func (o *TridentOrchestrator) getBackendByBackendUUID(backendUUID string) (*stor
 	return nil, utils.NotFoundError(fmt.Sprintf("backend uuid %v was not found", backendUUID))
 }
 
-func (o *TridentOrchestrator) GetBackend(backendName string) (*storage.BackendExternal, error) {
+func (o *TridentOrchestrator) GetBackend(backendName string) (
+	backendExternal *storage.BackendExternal, err error) {
 	if o.bootstrapError != nil {
 		return nil, o.bootstrapError
 	}
 
-	defer recordTiming("backend_get")()
+	defer recordTiming("backend_get", &err)()
 
 	o.mutex.Lock()
 	defer o.mutex.Unlock()
@@ -1223,7 +1261,7 @@ func (o *TridentOrchestrator) GetBackend(backendName string) (*storage.BackendEx
 		return nil, utils.NotFoundError(fmt.Sprintf("backend %v was not found", backendName))
 	}
 
-	backendExternal := backend.ConstructExternal()
+	backendExternal = backend.ConstructExternal()
 	log.WithFields(log.Fields{
 		"backend":               backend,
 		"backendExternal":       backendExternal,
@@ -1233,12 +1271,13 @@ func (o *TridentOrchestrator) GetBackend(backendName string) (*storage.BackendEx
 	return backendExternal, nil
 }
 
-func (o *TridentOrchestrator) GetBackendByBackendUUID(backendUUID string) (*storage.BackendExternal, error) {
+func (o *TridentOrchestrator) GetBackendByBackendUUID(backendUUID string) (
+	backendExternal *storage.BackendExternal, err error) {
 	if o.bootstrapError != nil {
 		return nil, o.bootstrapError
 	}
 
-	defer recordTiming("backend_get")()
+	defer recordTiming("backend_get", &err)()
 
 	o.mutex.Lock()
 	defer o.mutex.Unlock()
@@ -1248,7 +1287,7 @@ func (o *TridentOrchestrator) GetBackendByBackendUUID(backendUUID string) (*stor
 		return nil, err
 	}
 
-	backendExternal := backend.ConstructExternal()
+	backendExternal = backend.ConstructExternal()
 	log.WithFields(log.Fields{
 		"backend":               backend,
 		"backendUUID":           backendUUID,
@@ -1259,7 +1298,8 @@ func (o *TridentOrchestrator) GetBackendByBackendUUID(backendUUID string) (*stor
 	return backendExternal, nil
 }
 
-func (o *TridentOrchestrator) ListBackends() ([]*storage.BackendExternal, error) {
+func (o *TridentOrchestrator) ListBackends() (
+	backendExternals []*storage.BackendExternal, err error) {
 	if o.bootstrapError != nil {
 		log.WithFields(log.Fields{
 			"bootstrapError": o.bootstrapError,
@@ -1267,7 +1307,7 @@ func (o *TridentOrchestrator) ListBackends() ([]*storage.BackendExternal, error)
 		return nil, o.bootstrapError
 	}
 
-	defer recordTiming("backend_list")()
+	defer recordTiming("backend_list", &err)()
 
 	o.mutex.Lock()
 	defer o.mutex.Unlock()
@@ -1280,7 +1320,7 @@ func (o *TridentOrchestrator) ListBackends() ([]*storage.BackendExternal, error)
 	return backends, nil
 }
 
-func (o *TridentOrchestrator) DeleteBackend(backendName string) error {
+func (o *TridentOrchestrator) DeleteBackend(backendName string) (err error) {
 	if o.bootstrapError != nil {
 		log.WithFields(log.Fields{
 			"bootstrapError": o.bootstrapError,
@@ -1288,7 +1328,7 @@ func (o *TridentOrchestrator) DeleteBackend(backendName string) error {
 		return o.bootstrapError
 	}
 
-	defer recordTiming("backend_delete")()
+	defer recordTiming("backend_delete", &err)()
 
 	o.mutex.Lock()
 	defer o.mutex.Unlock()
@@ -1301,7 +1341,7 @@ func (o *TridentOrchestrator) DeleteBackend(backendName string) error {
 	return o.deleteBackendByBackendUUID(backendName, backendUUID)
 }
 
-func (o *TridentOrchestrator) DeleteBackendByBackendUUID(backendName, backendUUID string) error {
+func (o *TridentOrchestrator) DeleteBackendByBackendUUID(backendName, backendUUID string) (err error) {
 	if o.bootstrapError != nil {
 		log.WithFields(log.Fields{
 			"bootstrapError": o.bootstrapError,
@@ -1309,7 +1349,7 @@ func (o *TridentOrchestrator) DeleteBackendByBackendUUID(backendName, backendUUI
 		return o.bootstrapError
 	}
 
-	defer recordTiming("backend_delete")()
+	defer recordTiming("backend_delete", &err)()
 
 	o.mutex.Lock()
 	defer o.mutex.Unlock()
@@ -1363,7 +1403,7 @@ func (o *TridentOrchestrator) AddVolume(volumeConfig *storage.VolumeConfig) (
 		return nil, o.bootstrapError
 	}
 
-	defer recordTiming("volume_add")()
+	defer recordTiming("volume_add", &err)()
 
 	o.mutex.Lock()
 	defer o.mutex.Unlock()
@@ -1598,7 +1638,7 @@ func (o *TridentOrchestrator) addVolumeFinish(
 	txn *storage.VolumeTransaction, vol *storage.Volume, backend *storage.Backend,
 ) (externalVol *storage.VolumeExternal, err error) {
 
-	recordTransactionTiming(txn)
+	recordTransactionTiming(txn, &err)
 
 	if vol.Config.Protocol == config.ProtocolAny {
 		vol.Config.Protocol = backend.GetProtocol()
@@ -1623,7 +1663,7 @@ func (o *TridentOrchestrator) CloneVolume(
 		return nil, o.bootstrapError
 	}
 
-	defer recordTiming("volume_clone")()
+	defer recordTiming("volume_clone", &err)()
 
 	o.mutex.Lock()
 	defer o.mutex.Unlock()
@@ -1861,12 +1901,13 @@ func (o *TridentOrchestrator) cloneVolumeRetry(
 // This func is used by volume import so it doesn't check core's o.volumes to see if the
 // volume exists or not. Instead it asks the driver if the volume exists before requesting
 // the volume size. Returns the VolumeExternal representation of the volume.
-func (o *TridentOrchestrator) GetVolumeExternal(volumeName string, backendName string) (*storage.VolumeExternal, error) {
+func (o *TridentOrchestrator) GetVolumeExternal(volumeName string, backendName string) (
+	volExternal *storage.VolumeExternal, err error) {
 	if o.bootstrapError != nil {
 		return nil, o.bootstrapError
 	}
 
-	defer recordTiming("volume_get_external")()
+	defer recordTiming("volume_get_external", &err)()
 
 	o.mutex.Lock()
 	defer o.mutex.Unlock()
@@ -1885,7 +1926,7 @@ func (o *TridentOrchestrator) GetVolumeExternal(volumeName string, backendName s
 		return nil, utils.NotFoundError(fmt.Sprintf("backend %s not found", backendName))
 	}
 
-	volExternal, err := backend.GetVolumeExternal(volumeName)
+	volExternal, err = backend.GetVolumeExternal(volumeName)
 	if err != nil {
 		return nil, err
 	}
@@ -1961,7 +2002,7 @@ func (o *TridentOrchestrator) LegacyImportVolume(
 		return nil, o.bootstrapError
 	}
 
-	defer recordTiming("volume_import_legacy")()
+	defer recordTiming("volume_import_legacy", &err)()
 
 	o.mutex.Lock()
 	defer o.mutex.Unlock()
@@ -2057,7 +2098,7 @@ func (o *TridentOrchestrator) ImportVolume(
 		return nil, fmt.Errorf("original name not specified")
 	}
 
-	defer recordTiming("volume_import")()
+	defer recordTiming("volume_import", &err)()
 
 	o.mutex.Lock()
 	defer o.mutex.Unlock()
@@ -2380,12 +2421,12 @@ func (o *TridentOrchestrator) importVolumeCleanup(
 	return err
 }
 
-func (o *TridentOrchestrator) GetVolume(volume string) (*storage.VolumeExternal, error) {
+func (o *TridentOrchestrator) GetVolume(volume string) (volExternal *storage.VolumeExternal, err error) {
 	if o.bootstrapError != nil {
 		return nil, o.bootstrapError
 	}
 
-	defer recordTiming("volume_get")()
+	defer recordTiming("volume_get", &err)()
 
 	o.mutex.Lock()
 	defer o.mutex.Unlock()
@@ -2426,7 +2467,7 @@ func (o *TridentOrchestrator) GetVolumeType(vol *storage.VolumeExternal) (
 		return config.UnknownVolumeType, o.bootstrapError
 	}
 
-	defer recordTiming("volume_get_type")()
+	defer recordTiming("volume_get_type", &err)()
 
 	o.mutex.Lock()
 	defer o.mutex.Unlock()
@@ -2454,22 +2495,23 @@ func (o *TridentOrchestrator) GetVolumeType(vol *storage.VolumeExternal) (
 	return
 }
 
-func (o *TridentOrchestrator) ListVolumes() ([]*storage.VolumeExternal, error) {
+func (o *TridentOrchestrator) ListVolumes() (volumes []*storage.VolumeExternal, err error) {
 	if o.bootstrapError != nil {
 		return nil, o.bootstrapError
 	}
 
-	defer recordTiming("volume_list")()
+	defer recordTiming("volume_list", &err)()
 
 	o.mutex.Lock()
 	defer o.mutex.Unlock()
 
-	volumes := make([]*storage.VolumeExternal, 0, len(o.volumes))
+	volumes = make([]*storage.VolumeExternal, 0, len(o.volumes))
 	for _, v := range o.volumes {
 		volumes = append(volumes, v.ConstructExternal())
 	}
 
 	sort.Sort(storage.ByVolumeExternalName(volumes))
+
 	return volumes, nil
 }
 
@@ -2593,7 +2635,7 @@ func (o *TridentOrchestrator) DeleteVolume(volumeName string) (err error) {
 		return o.bootstrapError
 	}
 
-	defer recordTiming("volume_delete")()
+	defer recordTiming("volume_delete", &err)()
 
 	o.mutex.Lock()
 	defer o.mutex.Unlock()
@@ -2642,17 +2684,17 @@ func (o *TridentOrchestrator) DeleteVolume(volumeName string) (err error) {
 	return o.deleteVolume(volumeName)
 }
 
-func (o *TridentOrchestrator) ListVolumesByPlugin(pluginName string) ([]*storage.VolumeExternal, error) {
+func (o *TridentOrchestrator) ListVolumesByPlugin(pluginName string) (volumes []*storage.VolumeExternal, err error) {
 	if o.bootstrapError != nil {
 		return nil, o.bootstrapError
 	}
 
-	defer recordTiming("volume_list_by_plugin")()
+	defer recordTiming("volume_list_by_plugin", &err)()
 
 	o.mutex.Lock()
 	defer o.mutex.Unlock()
 
-	volumes := make([]*storage.VolumeExternal, 0)
+	volumes = make([]*storage.VolumeExternal, 0)
 	for _, backend := range o.backends {
 		if backendName := backend.GetDriverName(); pluginName != backendName {
 			continue
@@ -2666,12 +2708,12 @@ func (o *TridentOrchestrator) ListVolumesByPlugin(pluginName string) ([]*storage
 
 func (o *TridentOrchestrator) PublishVolume(
 	volumeName string, publishInfo *utils.VolumePublishInfo,
-) error {
+) (err error) {
 	if o.bootstrapError != nil {
 		return o.bootstrapError
 	}
 
-	defer recordTiming("volume_publish")()
+	defer recordTiming("volume_publish", &err)()
 
 	o.mutex.Lock()
 	defer o.mutex.Unlock()
@@ -2690,7 +2732,7 @@ func (o *TridentOrchestrator) PublishVolume(
 	}
 	publishInfo.Nodes = nodes
 	publishInfo.BackendUUID = volume.BackendUUID
-	return o.backends[volume.BackendUUID].Driver.Publish(volume.Config.InternalName, publishInfo)
+	return o.backends[volume.BackendUUID].PublishVolume(volume.Config, publishInfo)
 }
 
 // AttachVolume mounts a volume to the local host.  This method is currently only used by Docker,
@@ -2699,12 +2741,12 @@ func (o *TridentOrchestrator) PublishVolume(
 // which the volume will be attached.
 func (o *TridentOrchestrator) AttachVolume(
 	volumeName, mountpoint string, publishInfo *utils.VolumePublishInfo,
-) error {
+) (err error) {
 	if o.bootstrapError != nil {
 		return o.bootstrapError
 	}
 
-	defer recordTiming("volume_attach")()
+	defer recordTiming("volume_attach", &err)()
 
 	o.mutex.Lock()
 	defer o.mutex.Unlock()
@@ -2757,12 +2799,12 @@ func (o *TridentOrchestrator) AttachVolume(
 // use the storage controller API.  It may be assumed that this method always runs on the host to
 // which the volume will be attached.  It ensures the volume is already mounted, and it attempts to
 // delete the mount point.
-func (o *TridentOrchestrator) DetachVolume(volumeName, mountpoint string) error {
+func (o *TridentOrchestrator) DetachVolume(volumeName, mountpoint string) (err error) {
 	if o.bootstrapError != nil {
 		return o.bootstrapError
 	}
 
-	defer recordTiming("volume_detach")()
+	defer recordTiming("volume_detach", &err)()
 
 	volume, ok := o.volumes[volumeName]
 	if !ok {
@@ -2775,7 +2817,7 @@ func (o *TridentOrchestrator) DetachVolume(volumeName, mountpoint string) error 
 	log.WithFields(log.Fields{"volume": volumeName, "mountpoint": mountpoint}).Debug("Unmounting volume.")
 
 	// Check if the mount point exists, so we know that it's attached and must be cleaned up
-	_, err := os.Stat(mountpoint)
+	_, err = os.Stat(mountpoint)
 	if err != nil {
 		// Not attached, so nothing to do
 		return nil
@@ -2792,12 +2834,12 @@ func (o *TridentOrchestrator) DetachVolume(volumeName, mountpoint string) error 
 }
 
 // SetVolumeState sets the state of a volume to a given value
-func (o *TridentOrchestrator) SetVolumeState(volumeName string, state storage.VolumeState) error {
+func (o *TridentOrchestrator) SetVolumeState(volumeName string, state storage.VolumeState) (err error) {
 	if o.bootstrapError != nil {
 		return o.bootstrapError
 	}
 
-	defer recordTiming("volume_set_state")()
+	defer recordTiming("volume_set_state", &err)()
 
 	o.mutex.Lock()
 	defer o.mutex.Unlock()
@@ -2837,7 +2879,7 @@ func (o *TridentOrchestrator) CreateSnapshot(
 		return nil, o.bootstrapError
 	}
 
-	defer recordTiming("snapshot_create")()
+	defer recordTiming("snapshot_create", &err)()
 
 	o.mutex.Lock()
 	defer o.mutex.Unlock()
@@ -2949,12 +2991,13 @@ func (o *TridentOrchestrator) addSnapshotCleanup(
 	return err
 }
 
-func (o *TridentOrchestrator) GetSnapshot(volumeName, snapshotName string) (*storage.SnapshotExternal, error) {
+func (o *TridentOrchestrator) GetSnapshot(volumeName, snapshotName string) (
+	snapshotExternal *storage.SnapshotExternal, err error) {
 	if o.bootstrapError != nil {
 		return nil, o.bootstrapError
 	}
 
-	defer recordTiming("snapshot_get")()
+	defer recordTiming("snapshot_get", &err)()
 
 	o.mutex.Lock()
 	defer o.mutex.Unlock()
@@ -3045,7 +3088,7 @@ func (o *TridentOrchestrator) DeleteSnapshot(volumeName, snapshotName string) (e
 		return o.bootstrapError
 	}
 
-	defer recordTiming("snapshot_delete")()
+	defer recordTiming("snapshot_delete", &err)()
 
 	o.mutex.Lock()
 	defer o.mutex.Unlock()
@@ -3138,17 +3181,17 @@ func (o *TridentOrchestrator) DeleteSnapshot(volumeName, snapshotName string) (e
 	return o.deleteSnapshot(snapshot.Config)
 }
 
-func (o *TridentOrchestrator) ListSnapshots() ([]*storage.SnapshotExternal, error) {
+func (o *TridentOrchestrator) ListSnapshots() (snapshots []*storage.SnapshotExternal, err error) {
 	if o.bootstrapError != nil {
 		return nil, o.bootstrapError
 	}
 
-	defer recordTiming("snapshot_list")()
+	defer recordTiming("snapshot_list", &err)()
 
 	o.mutex.Lock()
 	defer o.mutex.Unlock()
 
-	snapshots := make([]*storage.SnapshotExternal, 0, len(o.snapshots))
+	snapshots = make([]*storage.SnapshotExternal, 0, len(o.snapshots))
 	for _, s := range o.snapshots {
 		snapshots = append(snapshots, s.ConstructExternal())
 	}
@@ -3156,17 +3199,18 @@ func (o *TridentOrchestrator) ListSnapshots() ([]*storage.SnapshotExternal, erro
 	return snapshots, nil
 }
 
-func (o *TridentOrchestrator) ListSnapshotsByName(snapshotName string) ([]*storage.SnapshotExternal, error) {
+func (o *TridentOrchestrator) ListSnapshotsByName(snapshotName string) (
+	snapshots []*storage.SnapshotExternal, err error) {
 	if o.bootstrapError != nil {
 		return nil, o.bootstrapError
 	}
 
-	defer recordTiming("snapshot_list_by_snapshot_name")()
+	defer recordTiming("snapshot_list_by_snapshot_name", &err)()
 
 	o.mutex.Lock()
 	defer o.mutex.Unlock()
 
-	snapshots := make([]*storage.SnapshotExternal, 0)
+	snapshots = make([]*storage.SnapshotExternal, 0)
 	for _, s := range o.snapshots {
 		if s.Config.Name == snapshotName {
 			snapshots = append(snapshots, s.ConstructExternal())
@@ -3176,12 +3220,13 @@ func (o *TridentOrchestrator) ListSnapshotsByName(snapshotName string) ([]*stora
 	return snapshots, nil
 }
 
-func (o *TridentOrchestrator) ListSnapshotsForVolume(volumeName string) ([]*storage.SnapshotExternal, error) {
+func (o *TridentOrchestrator) ListSnapshotsForVolume(volumeName string) (
+	snapshots []*storage.SnapshotExternal, err error) {
 	if o.bootstrapError != nil {
 		return nil, o.bootstrapError
 	}
 
-	defer recordTiming("snapshot_list_by_volume_name")()
+	defer recordTiming("snapshot_list_by_volume_name", &err)()
 
 	o.mutex.Lock()
 	defer o.mutex.Unlock()
@@ -3190,7 +3235,7 @@ func (o *TridentOrchestrator) ListSnapshotsForVolume(volumeName string) ([]*stor
 		return nil, utils.NotFoundError(fmt.Sprintf("volume %s not found", volumeName))
 	}
 
-	snapshots := make([]*storage.SnapshotExternal, 0, len(o.snapshots))
+	snapshots = make([]*storage.SnapshotExternal, 0, len(o.snapshots))
 	for _, s := range o.snapshots {
 		if s.Config.VolumeName == volumeName {
 			snapshots = append(snapshots, s.ConstructExternal())
@@ -3200,12 +3245,13 @@ func (o *TridentOrchestrator) ListSnapshotsForVolume(volumeName string) ([]*stor
 	return snapshots, nil
 }
 
-func (o *TridentOrchestrator) ReadSnapshotsForVolume(volumeName string) ([]*storage.SnapshotExternal, error) {
+func (o *TridentOrchestrator) ReadSnapshotsForVolume(volumeName string) (
+	externalSnapshots []*storage.SnapshotExternal, err error) {
 	if o.bootstrapError != nil {
 		return nil, o.bootstrapError
 	}
 
-	defer recordTiming("snapshot_read_by_volume")()
+	defer recordTiming("snapshot_read_by_volume", &err)()
 
 	volume, ok := o.volumes[volumeName]
 	if !ok {
@@ -3217,7 +3263,7 @@ func (o *TridentOrchestrator) ReadSnapshotsForVolume(volumeName string) ([]*stor
 		return nil, err
 	}
 
-	externalSnapshots := make([]*storage.SnapshotExternal, 0)
+	externalSnapshots = make([]*storage.SnapshotExternal, 0)
 	for _, snapshot := range snapshots {
 		externalSnapshots = append(externalSnapshots, snapshot.ConstructExternal())
 	}
@@ -3225,12 +3271,12 @@ func (o *TridentOrchestrator) ReadSnapshotsForVolume(volumeName string) ([]*stor
 	return externalSnapshots, nil
 }
 
-func (o *TridentOrchestrator) ReloadVolumes() error {
+func (o *TridentOrchestrator) ReloadVolumes() (err error) {
 	if o.bootstrapError != nil {
 		return o.bootstrapError
 	}
 
-	defer recordTiming("volume_reload")()
+	defer recordTiming("volume_reload", &err)()
 
 	// Lock out all other workflows while we reload the volumes
 	o.mutex.Lock()
@@ -3254,7 +3300,7 @@ func (o *TridentOrchestrator) ReloadVolumes() error {
 	}
 
 	// Re-run the volume bootstrapping code
-	err := o.bootstrapVolumes()
+	err = o.bootstrapVolumes()
 
 	// If anything went wrong, reinstate the original volumes
 	if err != nil {
@@ -3272,7 +3318,7 @@ func (o *TridentOrchestrator) ResizeVolume(volumeName, newSize string) (err erro
 		return o.bootstrapError
 	}
 
-	defer recordTiming("volume_resize")()
+	defer recordTiming("volume_resize", &err)()
 
 	o.mutex.Lock()
 	defer o.mutex.Unlock()
@@ -3471,12 +3517,13 @@ func (o *TridentOrchestrator) getProtocol(
 	return resultProtocol, err
 }
 
-func (o *TridentOrchestrator) AddStorageClass(scConfig *storageclass.Config) (*storageclass.External, error) {
+func (o *TridentOrchestrator) AddStorageClass(scConfig *storageclass.Config) (
+	scExternal *storageclass.External, err error) {
 	if o.bootstrapError != nil {
 		return nil, o.bootstrapError
 	}
 
-	defer recordTiming("storageclass_add")()
+	defer recordTiming("storageclass_add", &err)()
 
 	o.mutex.Lock()
 	defer o.mutex.Unlock()
@@ -3486,7 +3533,7 @@ func (o *TridentOrchestrator) AddStorageClass(scConfig *storageclass.Config) (*s
 	if _, ok := o.storageClasses[sc.GetName()]; ok {
 		return nil, fmt.Errorf("storage class %s already exists", sc.GetName())
 	}
-	err := o.storeClient.AddStorageClass(sc)
+	err = o.storeClient.AddStorageClass(sc)
 	if err != nil {
 		return nil, err
 	}
@@ -3507,12 +3554,13 @@ func (o *TridentOrchestrator) AddStorageClass(scConfig *storageclass.Config) (*s
 	return sc.ConstructExternal(), nil
 }
 
-func (o *TridentOrchestrator) GetStorageClass(scName string) (*storageclass.External, error) {
+func (o *TridentOrchestrator) GetStorageClass(scName string) (
+	scExternal *storageclass.External, err error) {
 	if o.bootstrapError != nil {
 		return nil, o.bootstrapError
 	}
 
-	defer recordTiming("storageclass_get")()
+	defer recordTiming("storageclass_get", &err)()
 
 	o.mutex.Lock()
 	defer o.mutex.Unlock()
@@ -3526,12 +3574,13 @@ func (o *TridentOrchestrator) GetStorageClass(scName string) (*storageclass.Exte
 	return sc.ConstructExternal(), nil
 }
 
-func (o *TridentOrchestrator) ListStorageClasses() ([]*storageclass.External, error) {
+func (o *TridentOrchestrator) ListStorageClasses() (
+	scExternals []*storageclass.External, err error) {
 	if o.bootstrapError != nil {
 		return nil, o.bootstrapError
 	}
 
-	defer recordTiming("storageclass_list")()
+	defer recordTiming("storageclass_list", &err)()
 
 	o.mutex.Lock()
 	defer o.mutex.Unlock()
@@ -3543,12 +3592,12 @@ func (o *TridentOrchestrator) ListStorageClasses() ([]*storageclass.External, er
 	return storageClasses, nil
 }
 
-func (o *TridentOrchestrator) DeleteStorageClass(scName string) error {
+func (o *TridentOrchestrator) DeleteStorageClass(scName string) (err error) {
 	if o.bootstrapError != nil {
 		return o.bootstrapError
 	}
 
-	defer recordTiming("storageclass_delete")()
+	defer recordTiming("storageclass_delete", &err)()
 
 	o.mutex.Lock()
 	defer o.mutex.Unlock()
@@ -3563,7 +3612,8 @@ func (o *TridentOrchestrator) DeleteStorageClass(scName string) error {
 	// to successful deletion, the storage class will be reloaded upon reboot
 	// automatically, which is consistent with the method never having returned
 	// successfully.
-	if err := o.storeClient.DeleteStorageClass(sc); err != nil {
+	err = o.storeClient.DeleteStorageClass(sc)
+	if err != nil {
 		return err
 	}
 	delete(o.storageClasses, scName)
@@ -3602,12 +3652,12 @@ func (o *TridentOrchestrator) reconcileNodeAccessOnBackend(b *storage.Backend) e
 	return nil
 }
 
-func (o *TridentOrchestrator) AddNode(node *utils.Node) error {
+func (o *TridentOrchestrator) AddNode(node *utils.Node) (err error) {
 	if o.bootstrapError != nil {
 		return o.bootstrapError
 	}
 
-	defer recordTiming("node_add")()
+	defer recordTiming("node_add", &err)()
 
 	o.mutex.Lock()
 	defer o.mutex.Unlock()
@@ -3621,12 +3671,12 @@ func (o *TridentOrchestrator) AddNode(node *utils.Node) error {
 	return o.reconcileNodeAccessOnAllBackends()
 }
 
-func (o *TridentOrchestrator) GetNode(nName string) (*utils.Node, error) {
+func (o *TridentOrchestrator) GetNode(nName string) (node *utils.Node, err error) {
 	if o.bootstrapError != nil {
 		return nil, o.bootstrapError
 	}
 
-	defer recordTiming("node_get")()
+	defer recordTiming("node_get", &err)()
 
 	o.mutex.Lock()
 	defer o.mutex.Unlock()
@@ -3638,29 +3688,29 @@ func (o *TridentOrchestrator) GetNode(nName string) (*utils.Node, error) {
 	return node, nil
 }
 
-func (o *TridentOrchestrator) ListNodes() ([]*utils.Node, error) {
+func (o *TridentOrchestrator) ListNodes() (nodes []*utils.Node, err error) {
 	if o.bootstrapError != nil {
 		return nil, o.bootstrapError
 	}
 
-	defer recordTiming("node_list")()
+	defer recordTiming("node_list", &err)()
 
 	o.mutex.Lock()
 	defer o.mutex.Unlock()
 
-	nodes := make([]*utils.Node, 0, len(o.nodes))
+	nodes = make([]*utils.Node, 0, len(o.nodes))
 	for _, node := range o.nodes {
 		nodes = append(nodes, node)
 	}
 	return nodes, nil
 }
 
-func (o *TridentOrchestrator) DeleteNode(nName string) error {
+func (o *TridentOrchestrator) DeleteNode(nName string) (err error) {
 	if o.bootstrapError != nil {
 		return o.bootstrapError
 	}
 
-	defer recordTiming("node_delete")()
+	defer recordTiming("node_delete", &err)()
 
 	o.mutex.Lock()
 	defer o.mutex.Unlock()

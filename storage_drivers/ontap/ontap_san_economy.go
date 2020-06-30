@@ -496,6 +496,8 @@ func (d *SANEconomyStorageDriver) Create(
 			continue
 		}
 
+		volConfig.Size = strconv.FormatUint(uint64(lunCreateResponse.Result.ActualSize()), 10)
+
 		// Save the fstype in a LUN attribute so we know what to do in Attach
 		attrResponse, err := d.API.LunSetAttribute(lunPath, LUNAttributeFSType, fstype)
 		if err = api.GetError(attrResponse, err); err != nil {
@@ -509,6 +511,33 @@ func (d *SANEconomyStorageDriver) Create(
 			log.WithField("name", name).Warning("Failed to save the driver context attribute for new volume.")
 		}
 
+		// Resize Flexvol to be the same size or bigger than sum of constituent LUNs because ONTAP creates
+		// larger LUNs sometimes based on internal geometry
+		lunSize := uint64(lunCreateResponse.Result.ActualSize())
+		if lunSize > sizeBytes {
+			if initialVolumeSize, err := d.API.VolumeSize(bucketVol); err != nil {
+				log.WithField("name", bucketVol).Warning("Failed to get volume size.")
+			} else {
+				err = d.resizeFlexvol(bucketVol, 0)
+				if err != nil {
+					log.WithFields(log.Fields{
+						"name":               bucketVol,
+						"initialVolumeSize":  initialVolumeSize,
+						"adjustedVolumeSize": uint64(initialVolumeSize) + lunSize - sizeBytes,
+					}).Warning("Failed to resize new volume to exact sum of LUNs' size.")
+				} else {
+					if adjustedVolumeSize, err := d.API.VolumeSize(bucketVol); err != nil {
+						log.WithField("name", bucketVol).
+							Warning("Failed to get volume size after the second resize operation.")
+					} else {
+						log.WithFields(log.Fields{
+							"name":               bucketVol,
+							"initialVolumeSize":  initialVolumeSize,
+							"adjustedVolumeSize": adjustedVolumeSize}).Debug("FlexVol resized.")
+					}
+				}
+			}
+		}
 		return nil
 	}
 
@@ -780,7 +809,9 @@ func (d *SANEconomyStorageDriver) DeleteBucketIfEmpty(bucketVol string) error {
 // Publish the volume to the host specified in publishInfo.  This method may or may not be running on the host
 // where the volume will be mounted, so it should limit itself to updating access rules, initiator groups, etc.
 // that require some host identity (but not locality) as well as storage controller API access.
-func (d *SANEconomyStorageDriver) Publish(name string, publishInfo *utils.VolumePublishInfo) error {
+func (d *SANEconomyStorageDriver) Publish(volConfig *storage.VolumeConfig, publishInfo *utils.VolumePublishInfo) error {
+
+	name := volConfig.InternalName
 
 	if d.Config.DebugTraceFlags["method"] {
 		fields := log.Fields{
@@ -1419,7 +1450,7 @@ func (d *SANEconomyStorageDriver) mapOntapSANLUN(volConfig *storage.VolumeConfig
 	}
 	// Map LUN
 	lunPath := GetLUNPathEconomy(flexvol, volConfig.InternalName)
-	lunID, err := d.API.LunMapIfNotMapped(d.Config.IgroupName, lunPath)
+	lunID, err := d.API.LunMapIfNotMapped(d.Config.IgroupName, lunPath, volConfig.ImportNotManaged)
 	if err != nil {
 		return err
 	}
@@ -1619,7 +1650,7 @@ func (d *SANEconomyStorageDriver) LUNExists(name, bucketPrefix string) (bool, st
 	return false, "", nil
 }
 
-// Resize expands the Flexvol containing the LUN and updates the LUN size
+// Create a LUN with the specified options and find (or create) a bucket volume for the LUN
 func (d *SANEconomyStorageDriver) Resize(volConfig *storage.VolumeConfig, sizeBytes uint64) error {
 
 	name := volConfig.InternalName
@@ -1655,33 +1686,46 @@ func (d *SANEconomyStorageDriver) Resize(volConfig *storage.VolumeConfig, sizeBy
 		return resizeError
 	}
 
-	volConfig.Size = strconv.FormatUint(totalLunSize, 10)
+	currentLunSize, resizeError := d.getLUNSize(name, bucketVol)
+	if err != nil {
+		log.WithField("error", err).Error("Failed to determine LUN size")
+		return resizeError
+	}
 
-	sameSize, err := utils.VolumeSizeWithinTolerance(int64(sizeBytes), int64(totalLunSize), tridentconfig.SANResizeDelta)
+	flexvolSize, err := d.getOptimalSizeForFlexvol(bucketVol, (sizeBytes - currentLunSize))
+	if err != nil {
+		log.Warnf("Could not calculate optimal Flexvol size. %v", err)
+		flexvolSize = totalLunSize + sizeBytes - currentLunSize
+	}
+
+	sameSize, err := utils.VolumeSizeWithinTolerance(int64(flexvolSize), int64(totalLunSize),
+		tridentconfig.SANResizeDelta)
 	if err != nil {
 		return err
 	}
 
 	if sameSize {
 		log.WithFields(log.Fields{
-			"requestedSize":     sizeBytes,
+			"requestedSize":     flexvolSize,
 			"currentVolumeSize": totalLunSize,
 			"name":              name,
 			"delta":             tridentconfig.SANResizeDelta,
-		}).Info("Requested size and current volume size are within the delta and therefore considered the same size for SAN resize operations.")
+		}).Info("Requested size and current volume size are within the delta and therefore considered " +
+			"the same size for SAN resize operations.")
+		volConfig.Size = strconv.FormatUint(currentLunSize, 10)
 		return nil
 	}
 
-	totalLunSizeBytes := totalLunSize
-	if sizeBytes < totalLunSizeBytes {
-		return fmt.Errorf("requested size %d is less than existing volume size %d", sizeBytes, totalLunSizeBytes)
+	if flexvolSize < totalLunSize {
+		return fmt.Errorf("requested size %d is less than existing volume size %d", flexvolSize, totalLunSize)
 	}
 
-	if aggrLimitsErr := checkAggregateLimitsForFlexvol(bucketVol, sizeBytes, d.Config, d.GetAPI()); aggrLimitsErr != nil {
+	if aggrLimitsErr := checkAggregateLimitsForFlexvol(bucketVol, flexvolSize, d.Config, d.GetAPI()); aggrLimitsErr != nil {
 		return aggrLimitsErr
 	}
 
-	if _, _, checkVolumeSizeLimitsError := drivers.CheckVolumeSizeLimits(sizeBytes, d.Config.CommonStorageDriverConfig); checkVolumeSizeLimitsError != nil {
+	if _, _, checkVolumeSizeLimitsError := drivers.CheckVolumeSizeLimits(flexvolSize,
+		d.Config.CommonStorageDriverConfig); checkVolumeSizeLimitsError != nil {
 		return checkVolumeSizeLimitsError
 	}
 
@@ -1708,7 +1752,7 @@ func (d *SANEconomyStorageDriver) Resize(volConfig *storage.VolumeConfig, sizeBy
 	}
 
 	// Resize FlexVol
-	response, err := d.API.VolumeSetSize(bucketVol, strconv.FormatUint(sizeBytes, 10))
+	response, err := d.API.VolumeSetSize(bucketVol, strconv.FormatUint(flexvolSize, 10))
 	if err = api.GetError(response, err); err != nil {
 		log.WithField("error", err).Error("Volume resize failed.")
 		return fmt.Errorf("volume resize failed")
@@ -1716,12 +1760,36 @@ func (d *SANEconomyStorageDriver) Resize(volConfig *storage.VolumeConfig, sizeBy
 
 	// Resize LUN
 	returnSize, err := d.API.LunResize(lunPath, int(sizeBytes))
-	if err != nil {
+	if err = api.GetError(response, err); err != nil {
 		log.WithField("error", err).Error("LUN resize failed.")
 		return fmt.Errorf("volume resize failed")
 	}
-	log.WithField("size", returnSize).Debug("Returning.")
+
 	volConfig.Size = strconv.FormatUint(returnSize, 10)
+
+	// Resize Flexvol to be the same size or bigger than LUN because ONTAP creates
+	// larger LUNs sometimes based on internal geometry
+	if returnSize > sizeBytes {
+		err = d.resizeFlexvol(bucketVol, 0)
+		if err != nil {
+			log.WithFields(log.Fields{
+				"name":               bucketVol,
+				"initialVolumeSize":  flexvolSize,
+				"adjustedVolumeSize": flexvolSize + returnSize - sizeBytes,
+			}).Warning("Failed to resize new volume to exact sum of LUNs' size.")
+		} else {
+			if adjustedVolumeSize, err := d.API.VolumeSize(bucketVol); err != nil {
+				log.WithField("name", bucketVol).
+					Warning("Failed to get volume size after the second resize operation.")
+			} else {
+				log.WithFields(log.Fields{
+					"name":               bucketVol,
+					"initialVolumeSize":  flexvolSize,
+					"adjustedVolumeSize": adjustedVolumeSize}).Debug("FlexVol resized.")
+			}
+		}
+	}
+	log.WithField("size", returnSize).Debug("Returning.")
 
 	return nil
 }
@@ -1749,11 +1817,16 @@ func (d *SANEconomyStorageDriver) resizeFlexvol(flexvol string, sizeBytes uint64
 	return nil
 }
 
-func (d *SANEconomyStorageDriver) ReconcileNodeAccess(nodes []*utils.Node, backendUUID string) error {
+func (d *SANEconomyStorageDriver) ReconcileNodeAccess(nodes []*utils.Node, _ string) error {
 
+	// Discover known nodes
 	nodeNames := make([]string, 0)
+	nodeIQNs := make([]string, 0)
 	for _, node := range nodes {
 		nodeNames = append(nodeNames, node.Name)
+		if node.IQN != "" {
+			nodeIQNs = append(nodeIQNs, node.IQN)
+		}
 	}
 	if d.Config.DebugTraceFlags["method"] {
 		fields := log.Fields{
@@ -1765,5 +1838,5 @@ func (d *SANEconomyStorageDriver) ReconcileNodeAccess(nodes []*utils.Node, backe
 		defer log.WithFields(fields).Debug("<<<< ReconcileNodeAccess")
 	}
 
-	return nil
+	return reconcileSANNodeAccess(d.API, d.Config.IgroupName, nodeIQNs)
 }

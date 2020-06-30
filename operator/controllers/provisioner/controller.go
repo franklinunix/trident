@@ -40,7 +40,6 @@ const (
 	CRName            = "TridentProvisioner"
 	Operator          = "trident-operator.netapp.io"
 	CacheSyncPeriod   = 300 * time.Second
-	installTimeout    = 30 * time.Second
 
 	AppStatusNotInstalled AppStatus = ""             // default
 	AppStatusInstalling   AppStatus = "Installing"   // Set only on controlling CR
@@ -727,7 +726,8 @@ func (c *Controller) alphaSnapshotCRDsPostinstallationCheck(tridentCR *netappv1.
 		// Log error in the event recorder and return error message
 		c.eventRecorder.Event(tridentCR, corev1.EventTypeWarning, string(AppStatusFailed), errorMessage)
 
-		c.updateCRStatus(tridentCR, logMessage, errorMessage, string(AppStatusFailed), currentInstalledTridentVersion)
+		c.updateCRStatus(tridentCR, logMessage, errorMessage, string(AppStatusFailed),
+			currentInstalledTridentVersion, &tridentCR.Status.CurrentInstallationParams)
 
 		// Alpha snapshot CRDs check failed, so fail the reconcile loop
 		return utils.ReconcileFailedError(fmt.Errorf(errorMessage))
@@ -969,7 +969,7 @@ func (c *Controller) reconcileTridentNotPresent() error {
 	statusMessage := "Installing Trident"
 
 	c.eventRecorder.Event(tridentCR, corev1.EventTypeNormal, string(AppStatusInstalling), statusMessage)
-	newTridentCR, err := c.updateCRStatus(tridentCR, logMessage, statusMessage, string(AppStatusInstalling), "")
+	newTridentCR, err := c.updateCRStatus(tridentCR, logMessage, statusMessage, string(AppStatusInstalling), "", nil)
 	if err != nil {
 		return utils.ReconcileFailedError(fmt.Errorf(
 			"unable to update status of the CR '%v' in namespace '%v' to installing",
@@ -1023,7 +1023,7 @@ func (c *Controller) controllingCRBasedReconcile(controllingCR *netappv1.Trident
 		statusMessage := "Uninstalled Trident" + crdNote + UninstallationNote
 
 		c.eventRecorder.Event(controllingCR, corev1.EventTypeWarning, controllingCR.Status.Status, statusMessage)
-		c.updateCRStatus(controllingCR, logMessage, statusMessage, string(AppStatusUninstalled), "")
+		c.updateCRStatus(controllingCR, logMessage, statusMessage, string(AppStatusUninstalled), "", nil)
 		log.Warnf(fmt.Sprintf("Remove CR '%v' in namespace '%v' with uninstalled status to allow new Trident"+
 			" installation.", controllingCR.Name, controllingCR.Namespace))
 
@@ -1079,7 +1079,8 @@ func (c *Controller) controllingCRBasedReconcile(controllingCR *netappv1.Trident
 			statusMessage := "Updating Trident"
 
 			c.eventRecorder.Event(controllingCR, corev1.EventTypeNormal, string(AppStatusUpdating), statusMessage)
-			controllingCR, err = c.updateCRStatus(controllingCR, logMessage, statusMessage, string(AppStatusUpdating), currentInstalledTridentVersion)
+			controllingCR, err = c.updateCRStatus(controllingCR, logMessage, statusMessage,
+				string(AppStatusUpdating), currentInstalledTridentVersion, &controllingCR.Status.CurrentInstallationParams)
 			if err != nil {
 				return utils.ReconcileFailedError(fmt.Errorf(
 					"unable to update status of the CR '%v' in namespace '%v' to installing",
@@ -1112,7 +1113,7 @@ func (c *Controller) updateAllCRs(message string) error {
 	for _, cr := range allCRs {
 		// Log error in the event recorder
 		c.eventRecorder.Event(&cr, corev1.EventTypeWarning, string(AppStatusError), message)
-		_, err = c.updateCRStatus(&cr, logMessage, message, string(AppStatusError), "")
+		_, err = c.updateCRStatus(&cr, logMessage, message, string(AppStatusError), "", nil)
 	}
 
 	return nil
@@ -1134,7 +1135,7 @@ func (c *Controller) updateOtherCRs(controllingCRName, controllingCRNamespace st
 			logMessage := "Updating other TridentProvisioner CRs in the same namespace."
 			statusMessage := fmt.Sprintf("Trident is bound to another CR '%v' in the same namespace",
 				controllingCRName)
-			_, err = c.updateCRStatus(&cr, logMessage, statusMessage, string(AppStatusError), "")
+			_, err = c.updateCRStatus(&cr, logMessage, statusMessage, string(AppStatusError), "", nil)
 		}
 	}
 
@@ -1151,7 +1152,7 @@ func (c *Controller) updateOtherCRs(controllingCRName, controllingCRNamespace st
 		logMessage := "Updating other TridentProvisioner CRs in the different namespace."
 		statusMessage := fmt.Sprintf("Trident is bound to another CR '%v' in a different namespace '%v'",
 			controllingCRName, controllingCRNamespace)
-		_, err = c.updateCRStatus(&cr, logMessage, statusMessage, string(AppStatusError), "")
+		_, err = c.updateCRStatus(&cr, logMessage, statusMessage, string(AppStatusError), "", nil)
 	}
 
 	return nil
@@ -1168,8 +1169,7 @@ func (c *Controller) updateNeeded(tridentK8sConfigVersion string) bool {
 	}
 
 	currentTridentConfigK8sVersion := utils.MustParseSemantic(tridentK8sConfigVersion).ToMajorMinorVersion()
-	K8sVersion := utils.MustParseSemantic(c.K8SVersion.GitVersion).
-		ToMajorMinorVersion()
+	K8sVersion := utils.MustParseSemantic(c.K8SVersion.GitVersion).ToMajorMinorVersion()
 
 	if currentTridentConfigK8sVersion.LessThan(K8sVersion) || currentTridentConfigK8sVersion.GreaterThan(K8sVersion) {
 		log.Infof("Kubernetes version has changed from: %v to: %v; Trident operator"+
@@ -1222,7 +1222,7 @@ func (c *Controller) getCurrentTridentAndK8sVersion(tridentCR *netappv1.TridentP
 	var currentTridentVersionString string
 	var currentK8sVersionString string
 
-	i, err := installer.NewInstaller(c.KubeConfig, tridentCR.Namespace, installTimeout)
+	i, err := installer.NewInstaller(c.KubeConfig, tridentCR.Namespace, tridentCR.Spec.K8sTimeout)
 	if err != nil {
 		return "", "", utils.ReconcileFailedError(err)
 	}
@@ -1257,13 +1257,15 @@ func (c *Controller) installTridentAndUpdateStatus(tridentCR netappv1.TridentPro
 	currentInstalledTridentVersion, warningMessage string, shouldUpdate bool) error {
 
 	var identifiedTridentVersion string
+	var identifiedSpecValues *netappv1.TridentProvisionerSpecValues
 
 	// Install or Patch or Update Trident
-	i, err := installer.NewInstaller(c.KubeConfig, tridentCR.Namespace, installTimeout)
+	i, err := installer.NewInstaller(c.KubeConfig, tridentCR.Namespace, tridentCR.Spec.K8sTimeout)
 	if err != nil {
 		return utils.ReconcileFailedError(err)
 	}
-	if identifiedTridentVersion, err = i.InstallOrPatchTrident(tridentCR, currentInstalledTridentVersion, shouldUpdate); err != nil {
+	if identifiedSpecValues, identifiedTridentVersion, err = i.InstallOrPatchTrident(tridentCR, currentInstalledTridentVersion,
+		shouldUpdate); err != nil {
 		// Update status of the tridentCR  to `Failed`
 		logMessage := "Updating Trident Provisioner CR after failed installation."
 		statusMessage := fmt.Sprintf("Failed to install Trident; err: %s", err.Error())
@@ -1275,7 +1277,7 @@ func (c *Controller) installTridentAndUpdateStatus(tridentCR netappv1.TridentPro
 		// Log error in the event recorder and return error message
 		c.eventRecorder.Event(&tridentCR, corev1.EventTypeWarning, string(AppStatusFailed), statusMessage)
 
-		c.updateCRStatus(&tridentCR, logMessage, statusMessage, string(AppStatusFailed), currentInstalledTridentVersion)
+		c.updateCRStatus(&tridentCR, logMessage, statusMessage, string(AppStatusFailed), "", nil)
 
 		// Install failed, so fail the reconcile loop
 		return utils.ReconcileFailedError(err)
@@ -1292,7 +1294,8 @@ func (c *Controller) installTridentAndUpdateStatus(tridentCR netappv1.TridentPro
 	// Log success in the event recorder and return success message
 	c.eventRecorder.Event(&tridentCR, corev1.EventTypeNormal, string(AppStatusInstalled), statusMessage)
 
-	_, err = c.updateCRStatus(&tridentCR, logMessage, statusMessage, string(AppStatusInstalled), identifiedTridentVersion)
+	_, err = c.updateCRStatus(&tridentCR, logMessage, statusMessage, string(AppStatusInstalled),
+		identifiedTridentVersion, identifiedSpecValues)
 
 	return err
 }
@@ -1307,7 +1310,8 @@ func (c *Controller) uninstallTridentAndUpdateStatus(tridentCR netappv1.TridentP
 	statusMessage := "Uninstalling Trident"
 
 	c.eventRecorder.Event(&tridentCR, corev1.EventTypeNormal, string(AppStatusUninstalling), statusMessage)
-	newTridentCR, err := c.updateCRStatus(&tridentCR, logMessage, statusMessage, string(AppStatusUninstalling), currentInstalledTridentVersion)
+	newTridentCR, err := c.updateCRStatus(&tridentCR, logMessage, statusMessage, string(AppStatusUninstalling),
+		currentInstalledTridentVersion, &tridentCR.Status.CurrentInstallationParams)
 	if err != nil {
 		return nil, utils.ReconcileFailedError(fmt.Errorf(
 			"unable to update status of CR '%v' in namespace '%v' to uninstalling", tridentCR.Name,
@@ -1323,7 +1327,8 @@ func (c *Controller) uninstallTridentAndUpdateStatus(tridentCR netappv1.TridentP
 		// Log error in the event recorder and return error message
 		c.eventRecorder.Event(newTridentCR, corev1.EventTypeWarning, string(AppStatusFailed), statusMessage)
 
-		c.updateCRStatus(newTridentCR, logMessage, statusMessage, string(AppStatusFailed), currentInstalledTridentVersion)
+		c.updateCRStatus(newTridentCR, logMessage, statusMessage, string(AppStatusFailed),
+			currentInstalledTridentVersion, &tridentCR.Status.CurrentInstallationParams)
 
 		// Uninstall failed, so fail the reconcile loop
 		return nil, utils.ReconcileFailedError(err)
@@ -1346,7 +1351,7 @@ func (c *Controller) uninstallTridentAndUpdateStatus(tridentCR netappv1.TridentP
 	// Log successful uninstall in the event recorder and return success message
 	c.eventRecorder.Event(newTridentCR, corev1.EventTypeNormal, string(AppStatusUninstalled), statusMessage)
 
-	return c.updateCRStatus(newTridentCR, logMessage, statusMessage, string(AppStatusUninstalled), "")
+	return c.updateCRStatus(newTridentCR, logMessage, statusMessage, string(AppStatusUninstalled), "", nil)
 }
 
 // wipeout removes Trident object specifies in the wipeout list
@@ -1380,7 +1385,7 @@ func (c *Controller) wipeout(tridentCR netappv1.TridentProvisioner) (bool, error
 
 // uninstallTridentAll uninstalls Trident CSI, Trident CSI Preview, Trident Legacy
 func (c *Controller) uninstallTridentAll(namespace string) error {
-	i, err := installer.NewInstaller(c.KubeConfig, namespace, installTimeout)
+	i, err := installer.NewInstaller(c.KubeConfig, namespace, 0)
 	if err != nil {
 		return err
 	}
@@ -1396,7 +1401,7 @@ func (c *Controller) uninstallTridentAll(namespace string) error {
 
 // uninstallCSIPreviewTrident uninstalls Trident CSI Preview
 func (c *Controller) uninstallCSIPreviewTrident(namespace string) error {
-	i, err := installer.NewInstaller(c.KubeConfig, namespace, installTimeout)
+	i, err := installer.NewInstaller(c.KubeConfig, namespace, 0)
 	if err != nil {
 		return err
 	}
@@ -1413,7 +1418,7 @@ func (c *Controller) uninstallCSIPreviewTrident(namespace string) error {
 
 // uninstallLegacyTrident uninstalls Trident CSI Legacy
 func (c *Controller) uninstallLegacyTrident(namespace string) error {
-	i, err := installer.NewInstaller(c.KubeConfig, namespace, installTimeout)
+	i, err := installer.NewInstaller(c.KubeConfig, namespace, 0)
 	if err != nil {
 		return err
 	}
@@ -1431,7 +1436,7 @@ func (c *Controller) uninstallLegacyTrident(namespace string) error {
 // $ tridentctl obliviate crds
 func (c *Controller) obliviateCRDs(tridentCR netappv1.TridentProvisioner) error {
 	// Obliviate CRDs Trident
-	i, err := installer.NewInstaller(c.KubeConfig, tridentCR.Namespace, installTimeout)
+	i, err := installer.NewInstaller(c.KubeConfig, tridentCR.Namespace, tridentCR.Spec.K8sTimeout)
 	if err != nil {
 		return err
 	}
@@ -1624,7 +1629,7 @@ func (c *Controller) identifyControllingCRBasedOnStatus() (bool, *netappv1.Tride
 // updateCRStatus updates the status of a CR if required
 func (c *Controller) updateCRStatus(
 	tridentCR *netappv1.TridentProvisioner, logMessage, message, status, version string,
-) (*netappv1.TridentProvisioner, error) {
+	specValues *netappv1.TridentProvisionerSpecValues) (*netappv1.TridentProvisioner, error) {
 
 	// Update status of the tridentCR
 	log.WithFields(log.Fields{
@@ -1632,10 +1637,16 @@ func (c *Controller) updateCRStatus(
 		"namespace": tridentCR.Namespace,
 	}).Debug(logMessage)
 
+	var installParams netappv1.TridentProvisionerSpecValues
+	if specValues != nil {
+		installParams = *specValues
+	}
+
 	newStatusDetails := netappv1.TridentProvisionerStatus{
-		Message: message,
-		Status:  status,
-		Version: version,
+		Message:                   message,
+		Status:                    status,
+		Version:                   version,
+		CurrentInstallationParams: installParams,
 	}
 
 	if reflect.DeepEqual(tridentCR.Status, newStatusDetails) {
